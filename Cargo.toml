@@ -7,6 +7,7 @@ authors = ["Jorge Israel Peña <jorge.israel.p@gmail.com>"]
 diecast = {path = "../diecast"}
 docopt = "*"
 rustc-serialize = "*"
-git2 = "*"
+# git2 = "*"
+git2 = {path = "../../git2-rs"}
 regex = "*"
 url = "*"

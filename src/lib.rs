@@ -5,9 +5,10 @@ extern crate regex;
 extern crate url;
 extern crate rustc_serialize;
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::env;
+use std::path::{Path, PathBuf};
+use std::fs;
+
+use std::cell::RefCell;
 
 use diecast::{Site, Configuration};
 
@@ -22,6 +23,7 @@ struct Options {
     flag_verbose: bool,
     flag_remote: Option<String>,
     flag_branch: Option<String>,
+    flag_working_tree: bool,
 }
 
 static USAGE: &'static str = "
@@ -31,6 +33,7 @@ Usage:
 Options:
     -h, --help          Print this message
     -v, --verbose       Use verbose output
+    --working-tree      Build from the working tree
     --remote <name>     Push to a specific remote
     --branch <name>     Push to a specific branch
 
@@ -197,6 +200,426 @@ impl GitHubPages {
             self.branch = branch;
         }
     }
+
+    fn checkout_rev<'repo>(repo: &'repo Repository, rev: &str, target_dir: &Path, input_dir: &Path)
+                           -> Result<git2::Object<'repo>, git2::Error> {
+        let mut checkout_options = git2::build::CheckoutBuilder::new();
+        checkout_options
+            .force()
+            .update_index(false)
+            .remove_untracked(true)
+            .remove_ignored(true)
+            .path(input_dir) // should be site.configuration().input?
+            .target_dir(&target_dir.canonicalize().unwrap())
+            .notify_on(git2::CheckoutNotificationType::all())
+            .progress(|path, completed_steps, total_steps| {
+                if let Some(p) = path {
+                    println!("[{}/{}] {}", completed_steps, total_steps, p.display());
+                }
+            })
+            .notify(|notify_type, path, _baseline, _target, _workdir| {
+                if let Some(p) = path {
+                    println!("type: {}, path: {}", notify_type.bits(), p.display());
+                }
+
+                true
+            });
+
+        let commit = try!(repo.revparse_single(rev)
+                          .and_then(|r| r.peel(git2::ObjectType::Commit)));
+
+        let commit_id = commit.short_id().unwrap();
+        let short_sha = commit_id.as_str().unwrap();
+
+        println!("obj commit sha: {}", short_sha);
+
+        let tree = try!(commit.peel(git2::ObjectType::Tree));
+
+        println!("obj tree sha: {}", tree.short_id().unwrap().as_str().unwrap());
+
+        try!(repo.checkout_tree(&tree, Some(&mut checkout_options)));
+
+        Ok(commit)
+    }
+
+    fn credential_cb(url: &str, username_from_url: Option<&str>,
+                     allowed_types: git2::CredentialType)
+                     -> Result<git2::Cred, git2::Error> {
+        println!("url: {}, user: {:?}, creds: {}",
+                 url,
+                 username_from_url,
+                 allowed_types.bits());
+        git2::Cred::ssh_key_from_agent(username_from_url.unwrap())
+    }
+
+    fn clone_publish(remote_url: &str, repo: &Path, branch: &str, state: &RefCell<State>)
+                     -> Result<git2::Repository, git2::Error> {
+        let mut remote_callbacks = git2::RemoteCallbacks::new();
+        remote_callbacks
+            .credentials(GitHubPages::credential_cb)
+            .transfer_progress(|stats| {
+                let mut state = state.borrow_mut();
+                state.progress = Some(stats.to_owned());
+                print(&mut *state);
+                true
+            });
+
+        let mut checkout_builder = git2::build::CheckoutBuilder::new();
+        checkout_builder.progress(|path, cur, total| {
+            let mut state = state.borrow_mut();
+            state.path = path.map(|p| p.to_path_buf());
+            state.current = cur;
+            state.total = total;
+            print(&mut *state);
+        });
+
+        let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.remote_callbacks(remote_callbacks);
+
+        let mut repo_builder = git2::build::RepoBuilder::new();
+        repo_builder
+            .bare(true)
+            .fetch_options(fetch_options)
+            .branch(branch);
+
+        repo_builder.clone(remote_url, repo)
+    }
+
+    fn statuses(publish_repo: &Repository) -> Result<git2::Statuses, git2::Error> {
+        let mut status_options = git2::StatusOptions::new();
+        status_options
+            .show(git2::StatusShow::IndexAndWorkdir)
+            .include_untracked(false)
+            .include_ignored(false)
+            .include_unmodified(false)
+            .exclude_submodules(true)
+            .recurse_untracked_dirs(false)
+            .recurse_ignored_dirs(false)
+            .no_refresh(true);
+
+        // check here if there are diff index to working dir
+        publish_repo.statuses(Some(&mut status_options))
+    }
+
+    fn commit(publish_repo: &Repository, tree_oid: git2::Oid,
+              gen_from_commit: &git2::Object) -> Result<(), git2::Error> {
+        let commit_tree = try!(publish_repo.find_tree(tree_oid));
+
+        let commit = match publish_repo.head() {
+            Ok(head) => {
+                let peeled = head.peel(git2::ObjectType::Commit)
+                    .unwrap_or_else(|e| panic!("couldn't resolve HEAD to a commit"));
+
+                let commit = peeled.into_commit()
+                    .unwrap_or_else(|e| panic!("couldn't convert to commit"));
+
+                Some(commit)
+            },
+            Err(_) => None,
+        };
+
+        // this must go after commit is init cause vars are destroyed in reverse
+        // init order, so the commit would be destroyed, yielding a dangling
+        // reference for the vec containing the refs
+        let mut parents = vec![];
+
+        if let Some(ref commit) = commit {
+            parents.push(commit);
+        }
+
+        let author_sig = try!(publish_repo.signature());
+
+        let commit_id = gen_from_commit.short_id().unwrap();
+        let short_sha = commit_id.as_str().unwrap();
+
+        let commit_oid = try!(publish_repo.commit(Some("HEAD"),
+                                                  &author_sig, // author sig
+                                                  &author_sig, // committer sig
+                                                  &format!("generated from {}", short_sha),
+                                                  &commit_tree,
+                                                  &parents));
+
+        println!("commited as {}", commit_oid);
+
+        Ok(())
+    }
+
+    fn fetch(remote: &mut git2::Remote, branch: &str) -> Result<(), git2::Error> {
+        use std::io::{self, Write};
+        use std::str;
+
+        println!("  [*] connected for fetch");
+        let mut cb = git2::RemoteCallbacks::new();
+
+        cb.credentials(GitHubPages::credential_cb);
+
+        cb.sideband_progress(|data| {
+            print!("remote: {}", str::from_utf8(data).unwrap());
+            io::stdout().flush().unwrap();
+            true
+        });
+
+        // This callback gets called for each remote-tracking branch that gets
+        // updated. The message we output depends on whether it's a new one or an
+        // update.
+        cb.update_tips(|refname, a, b| {
+            if a.is_zero() {
+                println!("[new]     {:20} {}", b, refname);
+            } else {
+                println!("[updated] {:10}..{:10} {}", a, b, refname);
+            }
+            true
+        });
+
+        // Here we show processed and total objects in the pack and the amount of
+        // received data. Most frontends will probably want to show a percentage and
+        // the download rate.
+        cb.transfer_progress(|stats| {
+            if stats.received_objects() == stats.total_objects() {
+                print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
+                       stats.total_deltas());
+            } else if stats.total_objects() > 0 {
+                print!("Received {}/{} objects ({}) in {} bytes\r",
+                       stats.received_objects(),
+                       stats.total_objects(),
+                       stats.indexed_objects(),
+                       stats.received_bytes());
+            }
+            io::stdout().flush().unwrap();
+            true
+        });
+
+        let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.remote_callbacks(cb);
+
+        // TODO
+        // sub 'master' for e.g. gh-pages
+        println!("  [*] downloading fetch");
+        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}", branch=branch);
+
+        try!(remote.fetch(&[&refspec], Some(&mut fetch_options), None));
+
+        {
+            // If there are local objects (we got a thin pack), then tell the user
+            // how many objects we saved from having to cross the network.
+            let stats = remote.stats();
+            if stats.local_objects() > 0 {
+                println!("\rReceived {}/{} objects in {} bytes (used {} local \
+                          objects)", stats.indexed_objects(),
+                         stats.total_objects(), stats.received_bytes(),
+                         stats.local_objects());
+            } else {
+                println!("\rReceived {}/{} objects in {} bytes",
+                         stats.indexed_objects(), stats.total_objects(),
+                         stats.received_bytes());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn push(remote: &mut git2::Remote, branch: &str) -> Result<(), git2::Error> {
+        use std::io::{self, Write};
+        use std::str;
+
+        let mut cb = git2::RemoteCallbacks::new();
+
+        cb.credentials(GitHubPages::credential_cb);
+
+        cb.sideband_progress(|data| {
+            print!("remote: {}", str::from_utf8(data).unwrap());
+            io::stdout().flush().unwrap();
+            true
+        });
+
+        // This callback gets called for each remote-tracking branch that gets
+        // updated. The message we output depends on whether it's a new one or an
+        // update.
+        cb.update_tips(|refname, a, b| {
+            if a.is_zero() {
+                println!("[new]     {:20} {}", b, refname);
+            } else {
+                println!("[updated] {:10}..{:10} {}", a, b, refname);
+            }
+            true
+        });
+
+        // Here we show processed and total objects in the pack and the amount of
+        // received data. Most frontends will probably want to show a percentage and
+        // the download rate.
+        cb.transfer_progress(|stats| {
+            if stats.received_objects() == stats.total_objects() {
+                print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
+                       stats.total_deltas());
+            } else if stats.total_objects() > 0 {
+                print!("Sent {}/{} objects ({}) in {} bytes\r",
+                       stats.received_objects(),
+                       stats.total_objects(),
+                       stats.indexed_objects(),
+                       stats.received_bytes());
+            }
+            io::stdout().flush().unwrap();
+            true
+        });
+
+        let mut push_options = git2::PushOptions::new();
+        push_options.remote_callbacks(cb);
+
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}", branch=branch);
+
+        try!(remote.push(&[&refspec], Some(&mut push_options)));
+
+        Ok(())
+    }
+
+    // can pass sha, HEAD, origin/master, etc.
+    fn from_rev(&mut self, site: &mut Site, rev: &str) -> diecast::Result<()> {
+        use std::path::Path;
+        use std::cell::RefCell;
+
+        let repo = try!(Repository::discover("."));
+
+        let state = RefCell::new(State {
+            progress: None,
+            total: 0,
+            current: 0,
+            path: None,
+            newline: false,
+        });
+
+        let target_dir = PathBuf::from(".deploy");
+
+        if !target_dir.exists() {
+            try!(fs::create_dir(&target_dir));
+        }
+
+        // TODO
+        // can't popd right after build? should
+        try!(std::env::set_current_dir(&target_dir));
+
+        println!("  [*] checking out {}", rev);
+        let commit = try!(GitHubPages::checkout_rev(&repo, rev, &Path::new("."), &site.configuration().input));
+
+        // build
+        println!("  [*] building");
+        try!(site.build());
+
+        let output_dir = site.configuration().output.clone();
+        let publish_dir = PathBuf::from("publish.git");
+
+        // open publish repo
+        println!("output_dir = {}", output_dir.display());
+        println!("publish_dir = {}", publish_dir.display());
+
+        let publish_repo = if !publish_dir.exists() {
+            println!("  [*] cloning publish repo");
+            // TODO
+            // if they're the same remotes, get the remote and get it's origin.url()
+            // let origin = try!(repo.find_remote("origin"));
+            try!(GitHubPages::clone_publish("git@github.com:blaenk/blaenk.github.io.git",
+                                            &publish_dir, "master", &state))
+        } else {
+            let open_flags = git2::REPOSITORY_OPEN_BARE | git2::REPOSITORY_OPEN_NO_SEARCH;
+            try!(Repository::open_ext(&publish_dir, open_flags, vec![&target_dir]))
+        };
+
+        try!(publish_repo.set_workdir(&output_dir, false));
+
+        let mut origin = try!(publish_repo.find_remote("origin"));
+
+        println!("  [*] fetching");
+        try!(GitHubPages::fetch(&mut origin, "master"));
+
+        // TODO
+        // mixed?
+        println!("  [*] resetting");
+        let oid = try!(publish_repo.refname_to_id("refs/remotes/origin/master"));
+        let object = try!(publish_repo.find_object(oid, None));
+        try!(publish_repo.reset(&object, git2::ResetType::Mixed, None));
+
+        // add to index
+
+        let mut index = try!(publish_repo.index());
+
+        println!("  [*] adding");
+        try!(index.add_all(vec!["."], git2::ADD_DEFAULT, Some(&mut |path: &Path, _matched_spec: &[u8]| -> i32 {
+            let status = publish_repo.status_file(path).unwrap();
+
+            let ret = if status.contains(git2::STATUS_WT_MODIFIED) || status.contains(git2::STATUS_WT_NEW) {
+                println!("add '{}'", path.display());
+                0
+            } else {
+                1
+            };
+
+            // return 0 to confirm operation, > 0 to skip item, < 0 to abort scan
+            ret
+        })));
+
+        let statuses = try!(GitHubPages::statuses(&publish_repo));
+
+        if statuses.len() == 0 {
+            try!(index.clear());
+
+            println!("no changes");
+        } else {
+            println!("files changed: {}", statuses.len());
+
+            for status in statuses.iter() {
+                println!("→ {}", status.path().unwrap());
+            }
+
+            let tree_oid = try!(index.write_tree());
+
+            println!("  [*] committing");
+            try!(GitHubPages::commit(&publish_repo, tree_oid, &commit));
+
+            println!("  [*] pushing");
+            try!(GitHubPages::push(&mut origin, "master"));
+        }
+
+        Ok(())
+    }
+}
+
+struct State {
+    progress: Option<git2::Progress<'static>>,
+    total: usize,
+    current: usize,
+    path: Option<PathBuf>,
+    newline: bool,
+}
+
+fn print(state: &mut State) {
+    use std::io::{self, Write};
+
+    let stats = state.progress.as_ref().unwrap();
+    let network_pct = (100 * stats.received_objects()) / stats.total_objects();
+    let index_pct = (100 * stats.indexed_objects()) / stats.total_objects();
+    let co_pct = if state.total > 0 {
+        (100 * state.current) / state.total
+    } else {
+        0
+    };
+    let kbytes = stats.received_bytes() / 1024;
+    if stats.received_objects() == stats.total_objects() && false {
+        if !state.newline {
+            println!("");
+            state.newline = true;
+        }
+        print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
+               stats.total_deltas());
+    } else {
+        print!("net {:3}% ({:4} kb, {:5}/{:5})  /  idx {:3}% ({:5}/{:5})  \
+                /  chk {:3}% ({:4}/{:4}) {}\r",
+               network_pct, kbytes, stats.received_objects(),
+               stats.total_objects(),
+               index_pct, stats.indexed_objects(), stats.total_objects(),
+               co_pct, state.current, state.total,
+               state.path.as_ref().map(|s| s.to_string_lossy().into_owned())
+               .unwrap_or(String::new()));
+    }
+    io::stdout().flush().unwrap();
 }
 
 impl From<Candidate> for GitHubPages {
@@ -221,125 +644,7 @@ impl diecast::Command for GitHubPages {
 
     fn run(&mut self, site: &mut Site) -> diecast::Result<()> {
         self.configure(site.configuration_mut());
-
-        let output = site.configuration().output.clone();
-
-        try!(site.build());
-
-        // git rev-list --oneline --max-count=1 HEAD
-        let out = Command::new("git")
-                      .arg("rev-list")
-                      .arg("--oneline")
-                      .arg("--max-count=1")
-                      .arg("HEAD")
-                      .output()
-                      .unwrap_or_else(|e| panic!("git rev-list failed: {}", e));
-
-        let (sha, message) = out.stdout.split_at(7);
-
-        let sha = String::from_utf8_lossy(sha);
-        let message = String::from_utf8_lossy(message);
-
-        // has the repo been initialized?
-        let initialized = diecast::support::file_exists(&self.git);
-
-        if !initialized {
-            println!("  [*] initializing repository");
-            // git init --separate-git-dir .deploy.git
-            Command::new("git")
-                .arg("init")
-                .arg("--bare")
-                .arg(&self.git)
-                .status()
-                .unwrap_or_else(|e| panic!("git init failed: {}", e));
-        }
-
-        env::set_var("GIT_DIR", &self.git);
-        env::set_var("GIT_WORK_TREE", &output);
-
-        if !initialized {
-            println!("  [*] setting up remote: github-pages = {}", self.remote);
-            // git remote add github-pages <remote>
-            Command::new("git")
-                .arg("remote")
-                .arg("add")
-                .arg("github-pages")
-                .arg(&self.remote)
-                .status()
-                .unwrap_or_else(|e| panic!("git remote failed: {}", e));
-
-            println!("  [*] fetching remote: github-pages");
-            // git fetch github-pages
-            Command::new("git")
-                .arg("fetch")
-                .arg("github-pages")
-                .status()
-                .unwrap_or_else(|e| panic!("git fetch failed: {}", e));
-
-            println!("  [*] resetting to {}", self.branch);
-            // git reset github-pages/master
-            Command::new("git")
-                .arg("reset")
-                .arg(format!("github-pages/{}", self.branch))
-                .status()
-                .unwrap_or_else(|e| panic!("git reset failed: {}", e));
-        }
-
-        Command::new("git")
-            .arg("update-index")
-            .arg("-q")
-            .arg("--refresh")
-            .status()
-            .unwrap_or_else(|e| panic!("git update-index failed: {}", e));
-
-        // git diff-index --quiet HEAD --
-        let status = Command::new("git")
-            .arg("diff-index")
-            .arg("--quiet")
-            .arg("HEAD")
-            .arg("--")
-            .status()
-            .unwrap_or_else(|e| panic!("git diff-index failed: {}", e));
-
-        if status.success() {
-            println!("  [*] no changes found; exiting");
-            return Ok(());
-        }
-
-        println!("  [*] staging all changes");
-        // git add --all .
-        Command::new("git")
-            .arg("add")
-            .arg("--all")
-            .arg(".")
-            .status()
-            .unwrap_or_else(|e| panic!("git add failed: {}", e));
-
-        println!("  [*] committing site generated from {}: {}", sha, message);
-        // git commit -m "generated from <sha>"
-        Command::new("git")
-            .arg("commit")
-            .arg("-m")
-            .arg(format!("generated from {}", sha))
-            .status()
-            .unwrap_or_else(|e| panic!("git commit failed: {}", e));
-
-        println!("  [*] pushing");
-        // git push github-pages HEAD:master -f
-        Command::new("git")
-            .arg("push")
-            .arg("github-pages")
-            .arg("master")
-            .arg("-f")
-            .status()
-            .unwrap_or_else(|e| panic!("git push failed: {}", e));
-
-        env::remove_var("GIT_DIR");
-        env::remove_var("GIT_WORK_TREE");
-
-        println!("  [*] deploy complete");
-
-        Ok(())
+        self.from_rev(site, "origin/master")
     }
 }
 
