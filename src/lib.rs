@@ -432,7 +432,7 @@ impl GitHubPages {
             // if they're the same remotes, get the remote and get it's origin.url()
             // let origin = try!(repo.find_remote("origin"));
             try!(GitHubPages::clone_publish("git@github.com:blaenk/blaenk.github.io.git",
-                                            &publish_dir, "master", &state))
+                                            &publish_dir, &self.branch, &state))
         } else {
             let open_flags = git2::REPOSITORY_OPEN_BARE | git2::REPOSITORY_OPEN_NO_SEARCH;
             try!(Repository::open_ext(&publish_dir, open_flags, vec![&self.deploy_dir]))
@@ -448,7 +448,7 @@ impl GitHubPages {
         println!("  [*] fetching");
         // NOTE
         // this requires target_branch
-        try!(GitHubPages::fetch(&mut origin, "master"));
+        try!(GitHubPages::fetch(&mut origin, &self.branch));
 
         // TODO
         // mixed?
@@ -496,7 +496,7 @@ impl GitHubPages {
             println!("  [*] pushing");
             // NOTE
             // this requires target_branch
-            try!(GitHubPages::push(&mut origin, "master"));
+            try!(GitHubPages::push(&mut origin, &self.branch));
         }
 
         Ok(())
