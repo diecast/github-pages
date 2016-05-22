@@ -242,25 +242,15 @@ impl GitHubPages {
         Ok(commit)
     }
 
-    fn credential_cb(url: &str, username_from_url: Option<&str>,
-                     allowed_types: git2::CredentialType)
-                     -> Result<git2::Cred, git2::Error> {
-        println!("url: {}, user: {:?}, creds: {}",
-                 url,
-                 username_from_url,
-                 allowed_types.bits());
-        git2::Cred::ssh_key_from_agent(username_from_url.unwrap())
-    }
-
-    fn clone_publish(remote_url: &str, repo: &Path, branch: &str, state: &RefCell<State>)
+    fn clone_publish(remote_url: &str, repo: &Path, branch: &str, state: &RefCell<callbacks::CloneProgressState>)
                      -> Result<git2::Repository, git2::Error> {
         let mut remote_callbacks = git2::RemoteCallbacks::new();
         remote_callbacks
-            .credentials(GitHubPages::credential_cb)
+            .credentials(callbacks::credential)
             .transfer_progress(|stats| {
                 let mut state = state.borrow_mut();
                 state.progress = Some(stats.to_owned());
-                print(&mut *state);
+                callbacks::print_clone_state(&mut *state);
                 true
             });
 
@@ -270,7 +260,7 @@ impl GitHubPages {
             state.path = path.map(|p| p.to_path_buf());
             state.current = cur;
             state.total = total;
-            print(&mut *state);
+            callbacks::print_clone_state(&mut *state);
         });
 
         let mut fetch_options = git2::FetchOptions::new();
@@ -308,10 +298,10 @@ impl GitHubPages {
         let commit = match publish_repo.head() {
             Ok(head) => {
                 let peeled = head.peel(git2::ObjectType::Commit)
-                    .unwrap_or_else(|e| panic!("couldn't resolve HEAD to a commit"));
+                    .unwrap_or_else(|_| panic!("couldn't resolve HEAD to a commit"));
 
                 let commit = peeled.into_commit()
-                    .unwrap_or_else(|e| panic!("couldn't convert to commit"));
+                    .unwrap_or_else(|_| panic!("couldn't convert to commit"));
 
                 Some(commit)
             },
@@ -345,49 +335,13 @@ impl GitHubPages {
     }
 
     fn fetch(remote: &mut git2::Remote, branch: &str) -> Result<(), git2::Error> {
-        use std::io::{self, Write};
-        use std::str;
-
         println!("  [*] connected for fetch");
+
         let mut cb = git2::RemoteCallbacks::new();
-
-        cb.credentials(GitHubPages::credential_cb);
-
-        cb.sideband_progress(|data| {
-            print!("remote: {}", str::from_utf8(data).unwrap());
-            io::stdout().flush().unwrap();
-            true
-        });
-
-        // This callback gets called for each remote-tracking branch that gets
-        // updated. The message we output depends on whether it's a new one or an
-        // update.
-        cb.update_tips(|refname, a, b| {
-            if a.is_zero() {
-                println!("[new]     {:20} {}", b, refname);
-            } else {
-                println!("[updated] {:10}..{:10} {}", a, b, refname);
-            }
-            true
-        });
-
-        // Here we show processed and total objects in the pack and the amount of
-        // received data. Most frontends will probably want to show a percentage and
-        // the download rate.
-        cb.transfer_progress(|stats| {
-            if stats.received_objects() == stats.total_objects() {
-                print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
-                       stats.total_deltas());
-            } else if stats.total_objects() > 0 {
-                print!("Received {}/{} objects ({}) in {} bytes\r",
-                       stats.received_objects(),
-                       stats.total_objects(),
-                       stats.indexed_objects(),
-                       stats.received_bytes());
-            }
-            io::stdout().flush().unwrap();
-            true
-        });
+        cb.credentials(callbacks::credential);
+        cb.sideband_progress(callbacks::sideband_progress);
+        cb.update_tips(callbacks::update_tips);
+        cb.transfer_progress(callbacks::transfer_progress);
 
         let mut fetch_options = git2::FetchOptions::new();
         fetch_options.remote_callbacks(cb);
@@ -419,48 +373,12 @@ impl GitHubPages {
     }
 
     fn push(remote: &mut git2::Remote, branch: &str) -> Result<(), git2::Error> {
-        use std::io::{self, Write};
-        use std::str;
-
         let mut cb = git2::RemoteCallbacks::new();
 
-        cb.credentials(GitHubPages::credential_cb);
-
-        cb.sideband_progress(|data| {
-            print!("remote: {}", str::from_utf8(data).unwrap());
-            io::stdout().flush().unwrap();
-            true
-        });
-
-        // This callback gets called for each remote-tracking branch that gets
-        // updated. The message we output depends on whether it's a new one or an
-        // update.
-        cb.update_tips(|refname, a, b| {
-            if a.is_zero() {
-                println!("[new]     {:20} {}", b, refname);
-            } else {
-                println!("[updated] {:10}..{:10} {}", a, b, refname);
-            }
-            true
-        });
-
-        // Here we show processed and total objects in the pack and the amount of
-        // received data. Most frontends will probably want to show a percentage and
-        // the download rate.
-        cb.transfer_progress(|stats| {
-            if stats.received_objects() == stats.total_objects() {
-                print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
-                       stats.total_deltas());
-            } else if stats.total_objects() > 0 {
-                print!("Sent {}/{} objects ({}) in {} bytes\r",
-                       stats.received_objects(),
-                       stats.total_objects(),
-                       stats.indexed_objects(),
-                       stats.received_bytes());
-            }
-            io::stdout().flush().unwrap();
-            true
-        });
+        cb.credentials(callbacks::credential);
+        cb.sideband_progress(callbacks::sideband_progress);
+        cb.update_tips(callbacks::update_tips);
+        cb.transfer_progress(callbacks::transfer_progress);
 
         let mut push_options = git2::PushOptions::new();
         push_options.remote_callbacks(cb);
@@ -474,12 +392,9 @@ impl GitHubPages {
 
     // can pass sha, HEAD, origin/master, etc.
     fn from_rev(&mut self, site: &mut Site, rev: &str) -> diecast::Result<()> {
-        use std::path::Path;
-        use std::cell::RefCell;
-
         let repo = try!(Repository::discover("."));
 
-        let state = RefCell::new(State {
+        let state = RefCell::new(callbacks::CloneProgressState {
             progress: None,
             total: 0,
             current: 0,
@@ -506,10 +421,6 @@ impl GitHubPages {
 
         let output_dir = site.configuration().output.clone();
         let publish_dir = PathBuf::from("publish.git");
-
-        // open publish repo
-        println!("output_dir = {}", output_dir.display());
-        println!("publish_dir = {}", publish_dir.display());
 
         let publish_repo = if !publish_dir.exists() {
             println!("  [*] cloning publish repo");
@@ -545,15 +456,12 @@ impl GitHubPages {
         try!(index.add_all(vec!["."], git2::ADD_DEFAULT, Some(&mut |path: &Path, _matched_spec: &[u8]| -> i32 {
             let status = publish_repo.status_file(path).unwrap();
 
-            let ret = if status.contains(git2::STATUS_WT_MODIFIED) || status.contains(git2::STATUS_WT_NEW) {
-                println!("add '{}'", path.display());
+            // return 0 to confirm operation, > 0 to skip item, < 0 to abort scan
+            if status.contains(git2::STATUS_WT_MODIFIED) || status.contains(git2::STATUS_WT_NEW) {
                 0
             } else {
                 1
-            };
-
-            // return 0 to confirm operation, > 0 to skip item, < 0 to abort scan
-            ret
+            }
         })));
 
         let statuses = try!(GitHubPages::statuses(&publish_repo));
@@ -566,7 +474,7 @@ impl GitHubPages {
             println!("files changed: {}", statuses.len());
 
             for status in statuses.iter() {
-                println!("→ {}", status.path().unwrap());
+                println!("  + {}", status.path().unwrap());
             }
 
             let tree_oid = try!(index.write_tree());
@@ -580,46 +488,6 @@ impl GitHubPages {
 
         Ok(())
     }
-}
-
-struct State {
-    progress: Option<git2::Progress<'static>>,
-    total: usize,
-    current: usize,
-    path: Option<PathBuf>,
-    newline: bool,
-}
-
-fn print(state: &mut State) {
-    use std::io::{self, Write};
-
-    let stats = state.progress.as_ref().unwrap();
-    let network_pct = (100 * stats.received_objects()) / stats.total_objects();
-    let index_pct = (100 * stats.indexed_objects()) / stats.total_objects();
-    let co_pct = if state.total > 0 {
-        (100 * state.current) / state.total
-    } else {
-        0
-    };
-    let kbytes = stats.received_bytes() / 1024;
-    if stats.received_objects() == stats.total_objects() && false {
-        if !state.newline {
-            println!("");
-            state.newline = true;
-        }
-        print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
-               stats.total_deltas());
-    } else {
-        print!("net {:3}% ({:4} kb, {:5}/{:5})  /  idx {:3}% ({:5}/{:5})  \
-                /  chk {:3}% ({:4}/{:4}) {}\r",
-               network_pct, kbytes, stats.received_objects(),
-               stats.total_objects(),
-               index_pct, stats.indexed_objects(), stats.total_objects(),
-               co_pct, state.current, state.total,
-               state.path.as_ref().map(|s| s.to_string_lossy().into_owned())
-               .unwrap_or(String::new()));
-    }
-    io::stdout().flush().unwrap();
 }
 
 impl From<Candidate> for GitHubPages {
@@ -721,5 +589,97 @@ fn test_http_url() {
 
         assert_eq!(user, "blaenk");
         assert_eq!(project, "dots");
+    }
+}
+
+mod callbacks {
+    use std::io::{self, Write};
+    use std::path::PathBuf;
+    use std::str;
+
+    use git2;
+
+    pub fn credential(url: &str, username_from_url: Option<&str>,
+                      allowed_types: git2::CredentialType)
+                      -> Result<git2::Cred, git2::Error> {
+        println!("url: {}, user: {:?}, creds: {}",
+                 url,
+                 username_from_url,
+                 allowed_types.bits());
+        git2::Cred::ssh_key_from_agent(username_from_url.unwrap())
+    }
+
+    pub fn sideband_progress(data: &[u8]) -> bool {
+        print!("remote: {}", str::from_utf8(data).unwrap());
+        io::stdout().flush().unwrap();
+        true
+    }
+
+    // This callback gets called for each remote-tracking branch that gets
+    // updated. The message we output depends on whether it's a new one or an
+    // update.
+    pub fn update_tips(refname: &str, a: git2::Oid, b: git2::Oid) -> bool {
+        if a.is_zero() {
+            println!("[new]     {:20} {}", b, refname);
+        } else {
+            println!("[updated] {:10}..{:10} {}", a, b, refname);
+        }
+        true
+    }
+
+    // Here we show processed and total objects in the pack and the amount of
+    // received data. Most frontends will probably want to show a percentage and
+    // the download rate.
+    pub fn transfer_progress(stats: git2::Progress) -> bool {
+        if stats.received_objects() == stats.total_objects() {
+            print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
+                   stats.total_deltas());
+        } else if stats.total_objects() > 0 {
+            print!("Received {}/{} objects ({}) in {} bytes\r",
+                   stats.received_objects(),
+                   stats.total_objects(),
+                   stats.indexed_objects(),
+                   stats.received_bytes());
+        }
+        io::stdout().flush().unwrap();
+        true
+    }
+
+    pub struct CloneProgressState {
+        pub progress: Option<git2::Progress<'static>>,
+        pub total: usize,
+        pub current: usize,
+        pub path: Option<PathBuf>,
+        pub newline: bool,
+    }
+
+    pub fn print_clone_state(state: &mut CloneProgressState) {
+        let stats = state.progress.as_ref().unwrap();
+        let network_pct = (100 * stats.received_objects()) / stats.total_objects();
+        let index_pct = (100 * stats.indexed_objects()) / stats.total_objects();
+        let co_pct = if state.total > 0 {
+            (100 * state.current) / state.total
+        } else {
+            0
+        };
+        let kbytes = stats.received_bytes() / 1024;
+        if stats.received_objects() == stats.total_objects() && false {
+            if !state.newline {
+                println!("");
+                state.newline = true;
+            }
+            print!("Resolving deltas {}/{}\r", stats.indexed_deltas(),
+                   stats.total_deltas());
+        } else {
+            print!("net {:3}% ({:4} kb, {:5}/{:5})  /  idx {:3}% ({:5}/{:5})  \
+                    /  chk {:3}% ({:4}/{:4}) {}\r",
+                   network_pct, kbytes, stats.received_objects(),
+                   stats.total_objects(),
+                   index_pct, stats.indexed_objects(), stats.total_objects(),
+                   co_pct, state.current, state.total,
+                   state.path.as_ref().map(|s| s.to_string_lossy().into_owned())
+                   .unwrap_or(String::new()));
+        }
+        io::stdout().flush().unwrap();
     }
 }
