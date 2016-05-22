@@ -6,9 +6,8 @@ extern crate url;
 extern crate rustc_serialize;
 
 use std::path::{Path, PathBuf};
-use std::fs;
-
 use std::cell::RefCell;
+use std::fs;
 
 use diecast::{Site, Configuration};
 
@@ -412,6 +411,10 @@ impl GitHubPages {
         // can't popd right after build? should
         try!(std::env::set_current_dir(&target_dir));
 
+        // NOTE
+        // does anything require source_remote and source_branch?
+        // AFAIK it's just to detect()?
+
         println!("  [*] checking out {}", rev);
         let commit = try!(GitHubPages::checkout_rev(&repo, rev, &Path::new("."), &site.configuration().input));
 
@@ -424,6 +427,9 @@ impl GitHubPages {
 
         let publish_repo = if !publish_dir.exists() {
             println!("  [*] cloning publish repo");
+            // NOTE
+            // this requires target_remote and target_branch
+
             // TODO
             // if they're the same remotes, get the remote and get it's origin.url()
             // let origin = try!(repo.find_remote("origin"));
@@ -436,14 +442,21 @@ impl GitHubPages {
 
         try!(publish_repo.set_workdir(&output_dir, false));
 
+        // NOTE
+        // this assumes there's an origin remote
+        // safe assumption? we created the repo after all
         let mut origin = try!(publish_repo.find_remote("origin"));
 
         println!("  [*] fetching");
+        // NOTE
+        // this requires target_branch
         try!(GitHubPages::fetch(&mut origin, "master"));
 
         // TODO
         // mixed?
         println!("  [*] resetting");
+        // NOTE
+        // this requires target_branch
         let oid = try!(publish_repo.refname_to_id("refs/remotes/origin/master"));
         let object = try!(publish_repo.find_object(oid, None));
         try!(publish_repo.reset(&object, git2::ResetType::Mixed, None));
@@ -483,6 +496,8 @@ impl GitHubPages {
             try!(GitHubPages::commit(&publish_repo, tree_oid, &commit));
 
             println!("  [*] pushing");
+            // NOTE
+            // this requires target_branch
             try!(GitHubPages::push(&mut origin, "master"));
         }
 
