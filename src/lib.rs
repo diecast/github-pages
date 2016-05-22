@@ -43,7 +43,7 @@ Deploy the site to GitHub Pages.
 pub struct GitHubPages {
     remote: String,
     branch: String,
-    git: PathBuf,
+    deploy_dir: PathBuf,
 }
 
 /// Deploy the site to GitHub Pages
@@ -64,7 +64,7 @@ impl GitHubPages {
         GitHubPages {
             remote: remote,
             branch: String::from(branch.as_ref()),
-            git: PathBuf::from(".deploy.git/"),
+            deploy_dir: PathBuf::from(".deploy"),
         }
     }
 
@@ -161,10 +161,10 @@ impl GitHubPages {
     }
 
     /// Set the desired git deploy directory.
-    pub fn git<P>(mut self, git: P) -> GitHubPages
+    pub fn deploy_dir<P>(mut self, deploy_dir: P) -> GitHubPages
         where P: Into<PathBuf>
     {
-        self.git = git.into();
+        self.deploy_dir = deploy_dir.into();
         self
     }
 
@@ -401,15 +401,13 @@ impl GitHubPages {
             newline: false,
         });
 
-        let target_dir = PathBuf::from(".deploy");
-
-        if !target_dir.exists() {
-            try!(fs::create_dir(&target_dir));
+        if !self.deploy_dir.exists() {
+            try!(fs::create_dir(&self.deploy_dir));
         }
 
         // TODO
         // can't popd right after build? should
-        try!(std::env::set_current_dir(&target_dir));
+        try!(std::env::set_current_dir(&self.deploy_dir));
 
         // NOTE
         // does anything require source_remote and source_branch?
@@ -437,7 +435,7 @@ impl GitHubPages {
                                             &publish_dir, "master", &state))
         } else {
             let open_flags = git2::REPOSITORY_OPEN_BARE | git2::REPOSITORY_OPEN_NO_SEARCH;
-            try!(Repository::open_ext(&publish_dir, open_flags, vec![&target_dir]))
+            try!(Repository::open_ext(&publish_dir, open_flags, vec![&self.deploy_dir]))
         };
 
         try!(publish_repo.set_workdir(&output_dir, false));
@@ -512,11 +510,7 @@ impl From<Candidate> for GitHubPages {
             PagesType::Project => String::from("project"),
         };
 
-        GitHubPages {
-            remote: candidate.remote,
-            branch: branch,
-            git: PathBuf::from("./deploy.git"),
-        }
+        GitHubPages::new(candidate.remote, branch)
     }
 }
 
