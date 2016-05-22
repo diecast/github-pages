@@ -16,13 +16,18 @@ use regex::Regex;
 use url::Url;
 use git2::Repository;
 
+// TODO
+// check what gitlab's pages is like
+// see if this can be made to work with it
+// in that case, merge this with diecast-git?
+
 #[derive(RustcDecodable, Debug)]
 struct Options {
     flag_jobs: Option<usize>,
     flag_verbose: bool,
-    flag_remote: Option<String>,
-    flag_branch: Option<String>,
-    flag_working_tree: bool,
+    flag_target_remote: Option<String>,
+    flag_target_branch: Option<String>,
+    flag_deploy_dir: Option<PathBuf>,
 }
 
 static USAGE: &'static str = "
@@ -30,48 +35,64 @@ Usage:
     diecast <name> [options]
 
 Options:
-    -h, --help          Print this message
-    -v, --verbose       Use verbose output
-    --working-tree      Build from the working tree
-    --remote <name>     Push to a specific remote
-    --branch <name>     Push to a specific branch
+    -h, --help                 Print this message
+    -v, --verbose              Use verbose output
+    --target-remote <name>     Push to a specific remote
+    --target-branch <name>     Push to a specific branch
+    --deploy-dir <path>        Directory for deployment temporary files
 
 Deploy the site to GitHub Pages.
 ";
 
 #[derive(Debug)]
 pub struct GitHubPages {
-    remote: String,
-    branch: String,
+    /// The target remote to push to.
+    ///
+    /// This can be the name of a remote in the current git repository, or it
+    /// can be a remote URL if it's another repository.
+    ///
+    /// e.g. `"origin"` or `"git@github.com:user/user.github.io.git"`
+    target_remote: String,
+
+    /// The target branch to push to.
+    ///
+    /// e.g. `"master"` or `"gh-pages"`
+    target_branch: String,
+
+    /// The directory to use to house the deployment files.
+    ///
+    /// Defaults to `.deploy/`, relative to the project root.
     deploy_dir: PathBuf,
 }
 
 /// Deploy the site to GitHub Pages
 impl GitHubPages {
-    pub fn new<R, B>(remote: R, branch: B) -> GitHubPages
+    pub fn new<R, B>(target_remote: R, target_branch: B) -> GitHubPages
         where R: AsRef<str>,
               B: AsRef<str>
     {
         // If there's a repo and a remote with the given remote name, obtain
         // it's url. Otherwise treat the remote as a remote url.
-        let remote = Repository::open(".").and_then(|repo| {
-            repo.find_remote(remote.as_ref()).map(|remote| {
-                let url = remote.url().expect("remote url is not utf8");
-                String::from(url)
+        let target_remote = Repository::discover(".").and_then(|repo| {
+            repo.find_remote(target_remote.as_ref()).map(|remote| {
+                String::from(remote.url().expect("remote url is not utf8"))
             })
-        }).unwrap_or_else(|_| String::from(remote.as_ref()));
+        }).unwrap_or_else(|_| String::from(target_remote.as_ref()));
 
         GitHubPages {
-            remote: remote,
-            branch: String::from(branch.as_ref()),
-            deploy_dir: PathBuf::from(".deploy"),
+            target_remote: target_remote,
+            target_branch: String::from(target_branch.as_ref()),
+            deploy_dir: PathBuf::from(".deploy/"),
         }
     }
 
     // TODO
-    // this needs testing
+    // perhaps this is too magical? it's not too difficult to just do
+    // GitHubPages::new("origin", "master");
 
     /// Detect the GitHub pages configuration
+    ///
+    /// Note that this assumes that the source and target repositories are the same.
     ///
     /// If there's a single GitHub remote and the project name is `*.github.io`,
     /// it's assumed to be user or organization pages, in which case it is
@@ -80,10 +101,6 @@ impl GitHubPages {
     /// If there's a single GitHub remote and the project name doesn't match the
     /// above pattern, then it's assumed to be project pages, in which case it
     /// is deployed to that remote's `gh-pages` branch.
-    ///
-    /// If there is more than one candidate remote, the situation is ambiguous
-    /// and the function panics. In this case you need to explicitly specify the
-    /// remote and branch via `GitHubPages::new()`
     ///
     /// The logic follows the information on GitHub:
     ///
@@ -95,9 +112,15 @@ impl GitHubPages {
     /// | organization project pages | `orgname.github.io/projectname`  | gh-pages |
     ///
     /// source: https://help.github.com/articles/user-organization-and-project-pages/
+    ///
+    /// # Panics
+    ///
+    /// If there is more than one candidate remote, the situation is ambiguous
+    /// and the function panics. In this case you need to explicitly specify the
+    /// remote and branch via `GitHubPages::new()`
 
     pub fn detect() -> Result<GitHubPages, git2::Error> {
-        let repo = try!(Repository::open("."));
+        let repo = try!(Repository::discover("."));
         let remotes = try!(repo.remotes());
 
         let git_re = git_url_pattern();
@@ -124,10 +147,8 @@ impl GitHubPages {
                                  .expect("regex syntax error");
 
             let pages_type = if !project_re.is_match(&project) {
-                // root pages
                 PagesType::Root
             } else {
-                // project pages
                 PagesType::Project
             };
 
@@ -145,18 +166,18 @@ impl GitHubPages {
     }
 
     /// Set the desired remote url to push to.
-    pub fn remote<S>(mut self, remote: S) -> GitHubPages
+    pub fn target_remote<S>(mut self, remote: S) -> GitHubPages
         where S: Into<String>
     {
-        self.remote = remote.into();
+        self.target_remote = remote.into();
         self
     }
 
     /// Set the desired target branch to push to.
-    pub fn branch<S>(mut self, branch: S) -> GitHubPages
+    pub fn target_branch<S>(mut self, branch: S) -> GitHubPages
         where S: Into<String>
     {
-        self.branch = branch.into();
+        self.target_branch = branch.into();
         self
     }
 
@@ -173,9 +194,7 @@ impl GitHubPages {
         // 2. construct site from configuration
         // 3. build site
 
-        let docopt = Docopt::new(USAGE)
-                         .unwrap_or_else(|e| e.exit())
-                         .help(true);
+        let docopt = Docopt::new(USAGE).unwrap_or_else(|e| e.exit()).help(true);
 
         let options: Options = docopt.decode().unwrap_or_else(|e| {
             e.exit();
@@ -191,16 +210,20 @@ impl GitHubPages {
         // for diecast overall?
         configuration.is_verbose = options.flag_verbose;
 
-        if let Some(remote) = options.flag_remote {
-            self.remote = remote;
+        if let Some(remote) = options.flag_target_remote {
+            self.target_remote = remote;
         }
 
-        if let Some(branch) = options.flag_branch {
-            self.branch = branch;
+        if let Some(branch) = options.flag_target_branch {
+            self.target_branch = branch;
+        }
+
+        if let Some(path) = options.flag_deploy_dir {
+            self.deploy_dir = path;
         }
     }
 
-    fn checkout_rev<'repo>(repo: &'repo Repository, rev: &str, target_dir: &Path, input_dir: &Path)
+    fn checkout_rev<'repo>(repo: &'repo Repository, rev: &str, input_dir: &Path, target_dir: &Path)
                            -> Result<git2::Object<'repo>, git2::Error> {
         let mut checkout_options = git2::build::CheckoutBuilder::new();
         checkout_options
@@ -208,7 +231,7 @@ impl GitHubPages {
             .update_index(false)
             .remove_untracked(true)
             .remove_ignored(true)
-            .path(input_dir) // should be site.configuration().input?
+            .path(input_dir)
             .target_dir(&target_dir.canonicalize().unwrap())
             .notify_on(git2::CheckoutNotificationType::all())
             .progress(|path, completed_steps, total_steps| {
@@ -216,13 +239,7 @@ impl GitHubPages {
                     println!("[{}/{}] {}", completed_steps, total_steps, p.display());
                 }
             })
-            .notify(|notify_type, path, _baseline, _target, _workdir| {
-                if let Some(p) = path {
-                    println!("type: {}, path: {}", notify_type.bits(), p.display());
-                }
-
-                true
-            });
+            .notify(|_notify_type, _path, _baseline, _target, _workdir| true);
 
         let commit = try!(repo.revparse_single(rev)
                           .and_then(|r| r.peel(git2::ObjectType::Commit)));
@@ -414,13 +431,16 @@ impl GitHubPages {
         // AFAIK it's just to detect()?
 
         println!("  [*] checking out {}", rev);
-        let commit = try!(GitHubPages::checkout_rev(&repo, rev, &Path::new("."), &site.configuration().input));
+        let commit = try!(GitHubPages::checkout_rev(&repo, rev, &site.configuration().input, &Path::new(".")));
 
         // build
         println!("  [*] building");
         try!(site.build());
 
         let output_dir = site.configuration().output.clone();
+
+        // NOTE
+        // this isn't customizable because who cares
         let publish_dir = PathBuf::from("publish.git");
 
         let publish_repo = if !publish_dir.exists() {
@@ -431,8 +451,11 @@ impl GitHubPages {
             // TODO
             // if they're the same remotes, get the remote and get it's origin.url()
             // let origin = try!(repo.find_remote("origin"));
-            try!(GitHubPages::clone_publish("git@github.com:blaenk/blaenk.github.io.git",
-                                            &publish_dir, &self.branch, &state))
+            //
+            // how about if user specifies a name instead of a url, then find
+            // the remote and get its url
+            try!(GitHubPages::clone_publish(&self.target_remote,
+                                            &publish_dir, &self.target_branch, &state))
         } else {
             let open_flags = git2::REPOSITORY_OPEN_BARE | git2::REPOSITORY_OPEN_NO_SEARCH;
             try!(Repository::open_ext(&publish_dir, open_flags, vec![&self.deploy_dir]))
@@ -448,7 +471,7 @@ impl GitHubPages {
         println!("  [*] fetching");
         // NOTE
         // this requires target_branch
-        try!(GitHubPages::fetch(&mut origin, &self.branch));
+        try!(GitHubPages::fetch(&mut origin, &self.target_branch));
 
         // TODO
         // mixed?
@@ -496,7 +519,7 @@ impl GitHubPages {
             println!("  [*] pushing");
             // NOTE
             // this requires target_branch
-            try!(GitHubPages::push(&mut origin, &self.branch));
+            try!(GitHubPages::push(&mut origin, &self.target_branch));
         }
 
         Ok(())
