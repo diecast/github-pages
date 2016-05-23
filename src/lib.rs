@@ -244,14 +244,7 @@ impl GitHubPages {
         let commit = try!(repo.revparse_single(rev)
                           .and_then(|r| r.peel(git2::ObjectType::Commit)));
 
-        let commit_id = commit.short_id().unwrap();
-        let short_sha = commit_id.as_str().unwrap();
-
-        println!("obj commit sha: {}", short_sha);
-
         let tree = try!(commit.peel(git2::ObjectType::Tree));
-
-        println!("obj tree sha: {}", tree.short_id().unwrap().as_str().unwrap());
 
         try!(repo.checkout_tree(&tree, Some(&mut checkout_options)));
 
@@ -338,14 +331,12 @@ impl GitHubPages {
         let commit_id = gen_from_commit.short_id().unwrap();
         let short_sha = commit_id.as_str().unwrap();
 
-        let commit_oid = try!(publish_repo.commit(Some("HEAD"),
-                                                  &author_sig, // author sig
-                                                  &author_sig, // committer sig
-                                                  &format!("generated from {}", short_sha),
-                                                  &commit_tree,
-                                                  &parents));
-
-        println!("commited as {}", commit_oid);
+        let _commit_oid = try!(publish_repo.commit(Some("HEAD"),
+                                                   &author_sig, // author sig
+                                                   &author_sig, // committer sig
+                                                   &format!("generated from {}", short_sha),
+                                                   &commit_tree,
+                                                   &parents));
 
         Ok(())
     }
@@ -633,13 +624,9 @@ mod callbacks {
 
     use git2;
 
-    pub fn credential(url: &str, username_from_url: Option<&str>,
-                      allowed_types: git2::CredentialType)
+    pub fn credential(_url: &str, username_from_url: Option<&str>,
+                      _allowed_types: git2::CredentialType)
                       -> Result<git2::Cred, git2::Error> {
-        println!("url: {}, user: {:?}, creds: {}",
-                 url,
-                 username_from_url,
-                 allowed_types.bits());
         git2::Cred::ssh_key_from_agent(username_from_url.unwrap())
     }
 
