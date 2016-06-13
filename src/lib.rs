@@ -421,6 +421,12 @@ impl GitHubPages {
         // does anything require source_remote and source_branch?
         // AFAIK it's just to detect()?
 
+        if site.configuration().input.exists() {
+            println!("  [*] removing stale input dir at {}",
+                     site.configuration().input.display());
+            try!(fs::remove_dir_all(&site.configuration().input));
+        }
+
         println!("  [*] checking out {}", rev);
         let commit = try!(GitHubPages::checkout_rev(&repo, rev, &site.configuration().input, &Path::new(".")));
 
