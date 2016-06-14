@@ -45,6 +45,21 @@ Deploy the site to GitHub Pages.
 ";
 
 #[derive(Debug)]
+pub enum BuildFrom {
+    /// Specifies a particular revision to build from.
+    ///
+    /// This can be any revision which can be parsed by `git rev-parse`, for
+    /// example `"HEAD"`, `"origin/master"`, etc.
+    ///
+    /// Under the hood this checks out the input directory at the state it was
+    /// in for the specified revision.
+    Revision(String),
+
+    /// Specifies to build from the working tree.
+    WorkingTree
+}
+
+#[derive(Debug)]
 pub struct GitHubPages {
     /// The target remote to push to.
     ///
@@ -63,6 +78,17 @@ pub struct GitHubPages {
     ///
     /// Defaults to `.deploy/`, relative to the project root.
     deploy_dir: PathBuf,
+
+    /// The revision to build from.
+    ///
+    /// Defaults to `Revision("HEAD")`, i.e. it'll build from the tree of the
+    /// latest commit.
+    ///
+    /// You can set it to `Revision("origin/master")` for example to only build
+    /// from the changes that have been pushed to origin remote so far. This way
+    /// you can continue to make local commits without accidentally pushing a
+    /// build from those potentially work-in-progress commits.
+    build_from: BuildFrom,
 }
 
 /// Deploy the site to GitHub Pages
@@ -83,6 +109,7 @@ impl GitHubPages {
             target_remote: target_remote,
             target_branch: String::from(target_branch.as_ref()),
             deploy_dir: PathBuf::from(".deploy/"),
+            build_from: BuildFrom::Revision(String::from("HEAD")),
         }
     }
 
@@ -163,6 +190,12 @@ impl GitHubPages {
             1 => Ok(GitHubPages::from(candidates.remove(0))),
             _ => panic!("more than one candidate found: {:?}", candidates),
         }
+    }
+
+    /// Specify where to build from.
+    pub fn build_from(mut self, build_from: BuildFrom) -> GitHubPages {
+        self.build_from = build_from;
+        self
     }
 
     /// Set the desired remote url to push to.
@@ -307,7 +340,7 @@ impl GitHubPages {
     }
 
     fn commit(publish_repo: &Repository, tree_oid: git2::Oid,
-              gen_from_commit: &git2::Object) -> Result<(), git2::Error> {
+              gen_from_commit: Option<git2::Object>) -> Result<(), git2::Error> {
         let commit_tree = try!(publish_repo.find_tree(tree_oid));
 
         let commit = match publish_repo.head() {
@@ -334,13 +367,17 @@ impl GitHubPages {
 
         let author_sig = try!(publish_repo.signature());
 
-        let commit_id = gen_from_commit.short_id().unwrap();
-        let short_sha = commit_id.as_str().unwrap();
+        let gen_from = if let Some(commit) = gen_from_commit {
+            let commit_id = commit.short_id().unwrap();
+            commit_id.as_str().unwrap().to_string()
+        } else {
+            String::from("the working tree")
+        };
 
         let _commit_oid = try!(publish_repo.commit(Some("HEAD"),
                                                    &author_sig, // author sig
                                                    &author_sig, // committer sig
-                                                   &format!("generated from {}", short_sha),
+                                                   &format!("generated from {}", gen_from),
                                                    &commit_tree,
                                                    &parents));
 
@@ -402,9 +439,27 @@ impl GitHubPages {
 
         Ok(())
     }
+}
 
-    // can pass sha, HEAD, origin/master, etc.
-    fn from_rev(&mut self, site: &mut Site, rev: &str) -> diecast::Result<()> {
+impl From<Candidate> for GitHubPages {
+    fn from(candidate: Candidate) -> GitHubPages {
+        let branch = match candidate.pages_type {
+            PagesType::Root => String::from("master"),
+            PagesType::Project => String::from("project"),
+        };
+
+        GitHubPages::new(candidate.remote, branch)
+    }
+}
+
+impl diecast::Command for GitHubPages {
+    fn description(&self) -> &'static str {
+        "Deploy the site to GitHub Pages"
+    }
+
+    fn run(&mut self, site: &mut Site) -> diecast::Result<()> {
+        self.configure(site.configuration_mut());
+
         let repo = try!(Repository::discover("."));
 
         let state = RefCell::new(callbacks::CloneProgressState {
@@ -419,19 +474,38 @@ impl GitHubPages {
             try!(fs::create_dir(&self.deploy_dir));
         }
 
-        println!("  [*] checking out {}", rev);
+        self.deploy_dir = self.deploy_dir.canonicalize().unwrap();
 
-        let commit = try!(GitHubPages::checkout_rev(&repo, rev, &site.configuration().input,
-                                                    &self.deploy_dir.canonicalize().unwrap()));
+        let commit = if let BuildFrom::Revision(ref rev) = self.build_from {
+            println!("  [*] checking out {}", rev);
+            Some(try!(GitHubPages::checkout_rev(&repo, rev, &site.configuration().input,
+                                                &self.deploy_dir)))
+        } else {
+            None
+        };
 
         // build
         println!("  [*] building");
-        let old_current_dir = env::current_dir().unwrap();
-        try!(env::set_current_dir(&self.deploy_dir));
+
+        let old_current_dir = if let BuildFrom::Revision(_) = self.build_from {
+            // need to set dir so that paths are the same as during normal build
+            // in short, current dir has to be the one that contains the input/ dir
+            let old_current_dir = env::current_dir().unwrap();
+            try!(env::set_current_dir(&self.deploy_dir));
+            Some(old_current_dir)
+        } else {
+            site.configuration_mut().output = self.deploy_dir.join("output");
+            None
+        };
+
         try!(site.build());
 
+        // deploy
         let output_dir = site.configuration().output.clone();
-        let publish_dir = PathBuf::from("publish.git");
+        let publish_dir = self.deploy_dir.join("publish.git");
+
+        println!("output: {:?}", output_dir);
+        println!("publish: {:?}", publish_dir);
 
         let publish_repo = if !publish_dir.exists() {
             println!("  [*] cloning publish repo");
@@ -487,37 +561,17 @@ impl GitHubPages {
             let tree_oid = try!(index.write_tree());
 
             println!("  [*] committing");
-            try!(GitHubPages::commit(&publish_repo, tree_oid, &commit));
+            try!(GitHubPages::commit(&publish_repo, tree_oid, commit));
 
             println!("  [*] pushing");
             try!(GitHubPages::push(&mut origin, &self.target_branch));
         }
 
-        try!(env::set_current_dir(&old_current_dir));
+        if let Some(old_current_dir) = old_current_dir {
+            try!(env::set_current_dir(&old_current_dir));
+        }
 
         Ok(())
-    }
-}
-
-impl From<Candidate> for GitHubPages {
-    fn from(candidate: Candidate) -> GitHubPages {
-        let branch = match candidate.pages_type {
-            PagesType::Root => String::from("master"),
-            PagesType::Project => String::from("project"),
-        };
-
-        GitHubPages::new(candidate.remote, branch)
-    }
-}
-
-impl diecast::Command for GitHubPages {
-    fn description(&self) -> &'static str {
-        "Deploy the site to GitHub Pages"
-    }
-
-    fn run(&mut self, site: &mut Site) -> diecast::Result<()> {
-        self.configure(site.configuration_mut());
-        self.from_rev(site, "origin/master")
     }
 }
 
