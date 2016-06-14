@@ -7,7 +7,7 @@ extern crate rustc_serialize;
 
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
-use std::fs;
+use std::{fs, env};
 
 use diecast::{Site, Configuration};
 
@@ -223,30 +223,36 @@ impl GitHubPages {
         }
     }
 
-    fn checkout_rev<'repo>(repo: &'repo Repository, rev: &str, input_dir: &Path, target_dir: &Path)
+    /// Checkout pathspec `input_dir` from `rev` into `deploy_dir`
+    fn checkout_rev<'repo>(repo: &'repo Repository, rev: &str, input_dir: &Path, deploy_dir: &Path)
                            -> Result<git2::Object<'repo>, git2::Error> {
         let mut checkout_options = git2::build::CheckoutBuilder::new();
         checkout_options
-            .force()
             .update_index(false)
             .remove_untracked(true)
             .remove_ignored(true)
-            .path(input_dir)
-            .target_dir(&target_dir.canonicalize().unwrap())
-            .notify_on(git2::CheckoutNotificationType::all())
             .progress(|path, completed_steps, total_steps| {
                 if let Some(p) = path {
-                    println!("[{}/{}] {}", completed_steps, total_steps, p.display());
+                    println!("[{}/{}] {}",
+                             completed_steps,
+                             total_steps,
+                             p.display());
                 }
             })
-            .notify(|_notify_type, _path, _baseline, _target, _workdir| true);
+            .path(input_dir)
+            .target_dir(&deploy_dir)
+            .force();
 
         let commit = try!(repo.revparse_single(rev)
                           .and_then(|r| r.peel(git2::ObjectType::Commit)));
 
         let tree = try!(commit.peel(git2::ObjectType::Tree));
 
+        let old_workdir = repo.workdir().unwrap().to_path_buf();
+
+        try!(repo.set_workdir(&deploy_dir, false));
         try!(repo.checkout_tree(&tree, Some(&mut checkout_options)));
+        try!(repo.set_workdir(&old_workdir, false));
 
         Ok(commit)
     }
@@ -413,44 +419,22 @@ impl GitHubPages {
             try!(fs::create_dir(&self.deploy_dir));
         }
 
-        // TODO
-        // can't popd right after build? should
-        try!(std::env::set_current_dir(&self.deploy_dir));
-
-        // NOTE
-        // does anything require source_remote and source_branch?
-        // AFAIK it's just to detect()?
-
-        if site.configuration().input.exists() {
-            println!("  [*] removing stale input dir at {}",
-                     site.configuration().input.display());
-            try!(fs::remove_dir_all(&site.configuration().input));
-        }
-
         println!("  [*] checking out {}", rev);
-        let commit = try!(GitHubPages::checkout_rev(&repo, rev, &site.configuration().input, &Path::new(".")));
+
+        let commit = try!(GitHubPages::checkout_rev(&repo, rev, &site.configuration().input,
+                                                    &self.deploy_dir.canonicalize().unwrap()));
 
         // build
         println!("  [*] building");
+        let old_current_dir = env::current_dir().unwrap();
+        try!(env::set_current_dir(&self.deploy_dir));
         try!(site.build());
 
         let output_dir = site.configuration().output.clone();
-
-        // NOTE
-        // this isn't customizable because who cares
         let publish_dir = PathBuf::from("publish.git");
 
         let publish_repo = if !publish_dir.exists() {
             println!("  [*] cloning publish repo");
-            // NOTE
-            // this requires target_remote and target_branch
-
-            // TODO
-            // if they're the same remotes, get the remote and get it's origin.url()
-            // let origin = try!(repo.find_remote("origin"));
-            //
-            // how about if user specifies a name instead of a url, then find
-            // the remote and get its url
             try!(GitHubPages::clone_publish(&self.target_remote,
                                             &publish_dir, &self.target_branch, &state))
         } else {
@@ -460,27 +444,17 @@ impl GitHubPages {
 
         try!(publish_repo.set_workdir(&output_dir, false));
 
-        // NOTE
-        // this assumes there's an origin remote
-        // safe assumption? we created the repo after all
         let mut origin = try!(publish_repo.find_remote("origin"));
 
         println!("  [*] fetching");
-        // NOTE
-        // this requires target_branch
         try!(GitHubPages::fetch(&mut origin, &self.target_branch));
 
-        // TODO
-        // mixed?
         println!("  [*] resetting");
-        // NOTE
-        // this requires target_branch
         let oid = try!(publish_repo.refname_to_id("refs/remotes/origin/master"));
         let object = try!(publish_repo.find_object(oid, None));
         try!(publish_repo.reset(&object, git2::ResetType::Mixed, None));
 
         // add to index
-
         let mut index = try!(publish_repo.index());
 
         let mut add_cb = |path: &Path, _matched_spec: &[u8]| -> i32 {
@@ -516,10 +490,10 @@ impl GitHubPages {
             try!(GitHubPages::commit(&publish_repo, tree_oid, &commit));
 
             println!("  [*] pushing");
-            // NOTE
-            // this requires target_branch
             try!(GitHubPages::push(&mut origin, &self.target_branch));
         }
+
+        try!(env::set_current_dir(&old_current_dir));
 
         Ok(())
     }

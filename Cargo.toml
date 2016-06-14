@@ -8,6 +8,6 @@ diecast = {path = "../diecast"}
 docopt = "*"
 rustc-serialize = "*"
 # git2 = "*"
-git2 = {path = "../../git2-rs"}
+git2 = {git = "https://github.com/alexcrichton/git2-rs"}
 regex = "*"
 url = "*"
