@@ -531,19 +531,8 @@ impl diecast::Command for GitHubPages {
         // add to index
         let mut index = try!(publish_repo.index());
 
-        let mut add_cb = |path: &Path, _matched_spec: &[u8]| -> i32 {
-            let status = publish_repo.status_file(path).unwrap();
-
-            // return 0 to confirm operation, > 0 to skip item, < 0 to abort scan
-            if status.contains(git2::STATUS_WT_MODIFIED) || status.contains(git2::STATUS_WT_NEW) {
-                0
-            } else {
-                1
-            }
-        };
-
         println!("  [*] adding");
-        try!(index.add_all(vec!["."], git2::ADD_DEFAULT, Some(&mut add_cb)));
+        try!(index.add_all(vec!["."], git2::ADD_DEFAULT, None));
 
         let statuses = try!(GitHubPages::statuses(&publish_repo));
 
