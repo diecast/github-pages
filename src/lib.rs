@@ -586,7 +586,8 @@ fn parse_git_url(url: &str, re: &Regex) -> Option<(String, String)> {
     re.captures(url).and_then(|cap| {
         cap.name("user").and_then(|user| {
             cap.name("project").map(|project| {
-                (String::from(user), String::from(project))
+                (String::from(user.as_str()),
+                 String::from(project.as_str()))
             })
         })
     })
